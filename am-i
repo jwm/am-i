@@ -1,8 +1,8 @@
-#!/usr/bin/python -tt
+#!/usr/bin/env python
 from __future__ import with_statement
 
 # am-i, a script to determine whether Google Calendar events currently apply
-# Copyright (c) 2010-3 John Morrissey <jwm@horde.net>
+# Copyright (c) 2010-7 John Morrissey <jwm@horde.net>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,91 +18,11 @@ from __future__ import with_statement
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307, USA.
 
-# I got tired of having to enable vacation(1) manually when I go on
-# vacation. I already track when I'm not working using Google Calendar,
-# so I wrote this program to automatically check whether I'm on vacation
-# and invoke a subprogram (in my case, vacation(1)) when I am. Instead of
-# executing a subprogram, it can also use its exitstatus to signal whether
-# a given condition currently applies, based on Google Calendar events.
-#
-# It's generic enough to be useful in a wide variety of cases. If you track
-# events in a Google Calendar and want to determine whether a type of event
-# applies right now, it should be easy to configure this program to work
-# for you.
-#
-# It tries to be intelligent about weekends and workday hours. For example,
-# you can configure it (using the day_start/day_end/weekend items) so that
-# if it's Friday and you're on vacation (the 'vacation' condition applies),
-# it will use a return date of the following Monday.
-
-# Useful invocations
-# ==================
-#
-# - Automatically detect when you're on vacation and invoke the vacation(1)
-#   utility to send an autoreply.
-#
-#       am-i vacation jwm -- vacation -m @MSG_FILE@ jwm
-#
-# - Determine whether you're on call. Use this as a conditional in your
-#   mail filteirng rules to determine, for example, whether to forward
-#   Nagios alerts to you via SMS only when you're on call.
-#
-#       am-i oncall jwm
-
-# Message template variables
-# ==========================
-#
-# This program can expand certain variables in a message template.
-# - $RETURN_ON
-#   The date when the specified condition is no longer met. For example,
-#   when calendar events indicate you're no longer on vacation. The
-#   format of this date may be overridden on the command line.
-# - $RETURN_ON_ROMAN
-#   $RETURN_ON, expressed in Roman numerals. This variable is not subject
-#   to the specified date format.
-
-# Subprogram variables
-# ====================
-#
-# This program can pass variables as arguments to subprograms.
-# - @MSG_FILE@
-#   If this variable is present in the subprogram's arguments, variables in
-#   the specified message template will be expanded. When expansion is
-#   complete, the resulting message is written to a temporary file. This
-#   variable is replaced by the filename of the temporary file.
-# - @RETURN_ON@
-#   The date when the specified condition is no longer met. For example,
-#   when calendar events indicate you're no longer on vacation. The
-#   format of this date may be overridden on the command line.
-
-# Exit status
-# ====================
-#
-# - If a subprogram *is* specified: exits nonzero if the subprogram
-#   invocation failed or an error was encountered in determining
-#   whether the specified condition applies. Otherwise, exits
-#   successfully (exitstatus 0). This is useful for invoking this
-#   program from a mail filter (such as procmail or maildrop) to
-#   invoke vacation(1) when on vacation.
-# - If a subprogram is *not* specified: exits successfully (exit status 0)
-#   if the specified condition applies. Exits with status 1 if the condition
-#   does not apply. Exits with any other exit status if an error was
-#   encountered. This makes the program useful as a condition in shell
-#   scripts or mail filtering recipes.
-
-# This should be ready to run under Python 3, once the Python gdata bindings
-# have Python 3 support:
-#
-#   http://code.google.com/p/gdata-python-client/issues/detail?id=229
-#
-# Python's 'except' syntax changed in Python 3 ('except Exception, e' ->
-# 'except Exception as e'). Support for 'as' has been backported as far
-# as Python 2.6, so this program now requires Python 2.6 or newer.
-
+import argparse
 import calendar
 import datetime
 import fcntl
-import optparse
+import httplib2
 import os
 import pickle
 import stat
@@ -111,14 +31,18 @@ import sys
 import tempfile
 import time
 import traceback
+import unittest
 
-import atom
-import gdata.calendar
-import gdata.calendar.client
+from apiclient import discovery
+from oauth2client import client
+from oauth2client import tools
+from oauth2client.file import Storage
 
-# E-mail address and password for your Google account.
-EMAIL = ''
-PASSWORD = ''
+# Remove '.readonly' and re-init to run the tests.
+SCOPES = 'https://www.googleapis.com/auth/calendar.readonly'
+CLIENT_SECRET_FILE = 'client_secret.json'
+APPLICATION_NAME = 'am-i'
+
 # Calendar to look for events in.
 CALENDAR_NAME = ''
 
@@ -190,36 +114,69 @@ EX_USAGE = 64
 EX_TEMPFAIL = 75
 
 
-def calService():
-	"""Get a Google Calendar service handle."""
+def get_credentials():
+	"""Gets valid user credentials from storage.
 
+	If nothing has been stored, or if the stored credentials are invalid,
+	the OAuth2 flow is completed to obtain the new credentials.
+	"""
+	home_dir = os.path.expanduser('~')
+	credential_dir = os.path.join(home_dir, '.credentials')
+	if not os.path.exists(credential_dir):
+		os.makedirs(credential_dir)
+	credential_path = os.path.join(
+		credential_dir, 'calendar-python-quickstart.json')
+
+	store = Storage(credential_path)
+	credentials = store.get()
+	if not credentials or credentials.invalid:
+		flow = client.flow_from_clientsecrets(CLIENT_SECRET_FILE, SCOPES)
+		flow.user_agent = APPLICATION_NAME
+
+		try:
+			import argparse
+			flags = argparse.ArgumentParser(
+				parents=[tools.argparser]
+			).parse_args()
+		except ImportError:
+			flags = None
+
+		if flags:
+			credentials = tools.run_flow(flow, store, flags)
+		else:  # Needed only for compatibility with Python 2.6
+			credentials = tools.run(flow, store)
+		print('Storing credentials to ' + credential_path)
+	return credentials
+
+
+def cal_service():
+	"""Get a Google Calendar service handle."""
 	try:
-		return calService.svc, calService.cal
+		return cal_service.svc
 	except AttributeError:
 		pass
 
-	calService.svc = gdata.calendar.client.CalendarClient()
-	calService.svc.ClientLogin(EMAIL, PASSWORD, '%s (%s)' % (
-		os.path.basename(sys.argv[0]), EMAIL,
-	))
+	credentials = get_credentials()
+	http = credentials.authorize(httplib2.Http())
+	cal_service.svc = discovery.build('calendar', 'v3', http=http)
 
-	calService.cal = [
-		cal
-		for cal
-		 in calService.svc.GetAllCalendarsFeed().entry
-		 if cal.title.text == CALENDAR_NAME
-	]
-	if not calService.cal:
-		raise Exception('Calendar "%s" doesn\'t exist, or your account doesn\'t have access to it.' %
-			CALENDAR_NAME)
-	calService.cal = calService.cal[0]
+	calendars = cal_service.svc.calendarList().list().execute()
+	for calendar in calendars['items']:
+		if CALENDAR_NAME not in [calendar['id'], calendar['summary']]:
+			continue
 
-	if DEBUG:
-		print('Feed timezone: %s' % calService.cal.timezone.value)
-	os.environ['TZ'] = calService.cal.timezone.value
-	time.tzset()
+		if DEBUG:
+			print('Feed timezone: {}'.format(calendar['timeZone']))
+		os.environ['TZ'] = calendar['timeZone']
+		time.tzset()
+		break
+	else:
+		raise Exception(
+			"Calendar '{}' doesn't exist, or you doesn't have "
+			'access to it.'.format(CALENDAR_NAME))
 
-	return calService.svc, calService.cal
+	return cal_service.svc
+
 
 def timezone_offset_string():
 	"""Get the current timezone's offset as a string. For example,
@@ -229,7 +186,7 @@ def timezone_offset_string():
 		tz_offset = -time.altzone / 60
 	else:
 		tz_offset = -time.timezone / 60
-	
+
 	if tz_offset < 0:
 		sign = '-'
 	else:
@@ -238,50 +195,48 @@ def timezone_offset_string():
 		sign, abs(tz_offset) / 60, abs(tz_offset) % 60,
 	)
 
+
 def get_events(day_start, day_end, weekend_days):
-	svc, cal = calService()
-
-	query = gdata.calendar.client.CalendarEventQuery()
-	query.max_results = 10000
-	query.singleevents = 'true'
-	query.orderby = 'starttime'
-
 	start = datetime.datetime.now()
 	start = wrap_day(start, day_start, day_end)
 	# Weekends consider the following Monday's events.
 	start = skip_weekend(start, weekend_days)
 
-	offset_str = timezone_offset_string()
+	end = datetime.datetime.combine(
+		start.date() + SEARCH_FOR_RETURN, datetime.time())
 
-	query.start_min = start.strftime('%Y-%m-%dT%H:%M:%S') + offset_str
-	query.start_max = datetime.datetime.combine(
-		start.date() + SEARCH_FOR_RETURN, datetime.time()).\
-		strftime('%Y-%m-%dT%H:%M:%S') + offset_str
+	offset_str = timezone_offset_string()
+	time_min = start.strftime('%Y-%m-%dT%H:%M:%S') + offset_str
+	time_max = end.strftime('%Y-%m-%dT%H:%M:%S') + offset_str
+
 	if DEBUG:
-		print('Fetching events from %s to %s.' % (
+		print('Fetching events from {} to {}.'.format(
 			query.start_min, query.start_max,
 		))
 
-	feed = svc.GetCalendarEventFeed(
-		uri=cal.GetLink('http://schemas.google.com/gCal/2005#eventFeed').href,
-		q=query)
-	# 'orderby starttime' yields most recent entries first,
-	# but we want to iterate in chronological order.
-	feed.entry.reverse()
+	svc = cal_service()
+	reply = svc.events().list(
+		calendarId=CALENDAR_NAME,
+		orderBy='startTime',
+		singleEvents=True,
+		timeMin=time_min,
+		timeMax=time_max).execute()
 
-	return feed.entry
+	return reply['items']
+
 
 def gcal2datetime(when):
 	"""Convert a Google Calendar date and time string to a
 	datetime.datetime instance."""
-	
+
 	try:
-		return datetime.datetime.strptime(when[:23], "%Y-%m-%dT%H:%M:%S.000")
+		return datetime.datetime.strptime(when[:19], '%Y-%m-%dT%H:%M:%S')
 	except ValueError:
 		try:
-			return datetime.datetime.strptime(when, "%Y-%m-%d")
+			return datetime.datetime.strptime(when, '%Y-%m-%d')
 		except ValueError:
 			return None
+
 
 def skip_weekend(when, days):
 	while when.weekday() in days:
@@ -289,6 +244,7 @@ def skip_weekend(when, days):
 			print('%s is during the weekend, adding one day.' % when)
 		when += datetime.timedelta(days=1)
 	return when
+
 
 def wrap_day(when, day_start, day_end):
 	"""If a datetime object is after the end of the workday, wrap it
@@ -303,17 +259,19 @@ def wrap_day(when, day_start, day_end):
 			when.date(), day_start)
 	return when
 
+
 def eligible_event(event, who, trigger_key):
-	for word in event.title.text.split():
+	for word in event['summary'].split():
 		if trigger_key == 'vacation' and \
 		   'vacation_everyone' in TRIGGERS and \
 		   word.lower() in TRIGGERS['vacation_everyone']['keywords']:
 			return True
-		if who in event.title.text and \
+		if who in event['summary'] and \
 		   word.lower() in TRIGGERS[trigger_key]['keywords']:
 			return True
 
 	return False
+
 
 def expected_return(now, events, trigger_key, who):
 	"""Calculate the date a condition no longer applies, honoring
@@ -322,7 +280,7 @@ def expected_return(now, events, trigger_key, who):
 	if DEBUG:
 		print('Now: %s' % now)
 
-	if type(now) == datetime.date:
+	if type(now) is datetime.date:
 		return_on = datetime.datetime.combine(now, datetime.time())
 	else:
 		return_on = now
@@ -338,17 +296,26 @@ def expected_return(now, events, trigger_key, who):
 	orig_return_on = return_on
 
 	for event in events:
+		if 'dateTime' in event['start']:
+			start = event['start']['dateTime']
+		else:
+			start = event['start']['date']
+
+		if 'dateTime' in event['end']:
+			end = event['end']['dateTime']
+		else:
+			end = event['end']['date']
+
 		if DEBUG:
-			print('Event: %s, from %s to %s' % (
-				event.title.text, event.when[0].start,
-				event.when[0].end,
+			print('Event: {}, from {} to {}'.format(
+				event['summary'], start, end,
 			))
 
 		if not eligible_event(event, who, trigger_key):
 			continue
 
-		start = gcal2datetime(event.when[0].start)
-		end = gcal2datetime(event.when[0].end)
+		start = gcal2datetime(start)
+		end = gcal2datetime(end)
 		if start > return_on or end < return_on:
 			continue
 
@@ -369,6 +336,7 @@ def expected_return(now, events, trigger_key, who):
 	if orig_return_on.date() >= return_on.date():
 		return None
 	return return_on
+
 
 def call_subprogram(success_exec, return_on, date_format, msg_template=None):
 	return_on_pretty = return_on.strftime(date_format)
@@ -409,7 +377,7 @@ def call_subprogram(success_exec, return_on, date_format, msg_template=None):
 	success_exec = [
 		expand_args(arg)
 		for arg
-		 in success_exec
+		in success_exec
 	]
 
 	if DEBUG:
@@ -421,8 +389,8 @@ def call_subprogram(success_exec, return_on, date_format, msg_template=None):
 	retcode = subprocess.call(success_exec)
 	if retcode != 0:
 		raise Exception(
-			'Subprogram invocation failed with exitstatus %d.' % \
-				retcode)
+			'Subprogram failed with exitstatus {}.'.format(retcode))
+
 
 def main(trigger_key, who, success_exec, options):
 	cache = os.path.expanduser(EVENTS_CACHE)
@@ -489,6 +457,7 @@ def main(trigger_key, who, success_exec, options):
 			os.close(fd)
 			sys.stderr.write(str(e))
 			sys.stderr.write('\n')
+			traceback.print_exc(file=sys.stderr)
 			return EX_TEMPFAIL
 
 	os.close(fd)
@@ -520,10 +489,6 @@ def main(trigger_key, who, success_exec, options):
 	# the specified condition has been met.
 	return EX_OK
 
-try:
-	import unittest
-except ImportError:
-	unittest.TestCase = object
 
 class ExpectedReturnTest(unittest.TestCase):
 	def setUp(self):
@@ -548,8 +513,8 @@ class ExpectedReturnTest(unittest.TestCase):
 		#   2020-05-11T14:00:00.000-04:00 to
 		#   2020-05-11T15:00:00.000-04:00
 		self.days = calendar.Calendar().monthdatescalendar(
-			datetime.datetime.now().year + 10,
-			datetime.datetime.now().month)[0]
+			datetime.datetime.now().year,
+			datetime.datetime.now().month + 2)[0]
 
 		TRIGGERS = {
 			'vacation': {
@@ -570,43 +535,46 @@ class ExpectedReturnTest(unittest.TestCase):
 		self._removeStaleEvents()
 
 	def _removeStaleEvents(self):
-		query = gdata.calendar.client.CalendarEventQuery(
-			text_query='am-i.testcase')
-		query.max_results = 10000
-		query.orderby = 'starttime'
+		svc = cal_service()
+		reply = svc.events().list(
+			calendarId=CALENDAR_NAME,
+			q='am-i.testcase').execute()
 
-		svc = calService()[0]
-		feed = svc.GetCalendarEventFeed(q=query)
-		for event in feed.entry:
+		for event in reply['items']:
 			# We search for events containing this string
 			# in the calendar query, but it doesn't hurt
 			# to be defensive since we're removing events.
-			if 'am-i.testcase' not in event.title.text:
+			if 'am-i.testcase' not in event['summary']:
 				continue
+
 			if DEBUG:
 				print('Removing stale test event %s (%s - %s)' % (
-					event.title.text, event.when[0].start,
-					event.when[0].end,
+					event['summary'], event['start'], event['end'],
 				))
-			# Force the delete. Fixed in:
-			# https://code.google.com/p/gdata-python-client/source/detail?r=f98fff494fb89fca12deede00c3567dd589e5f97
-			svc.Delete(event.GetEditLink().href, force=True)
+			svc.events().delete(
+				calendarId=CALENDAR_NAME, eventId=event['id']
+			).execute()
 
 	def _createEvent(self, title, start, end):
 		if DEBUG:
 			print('Creating event %s (%s - %s)' % (title, start, end))
 
-		event = gdata.calendar.data.CalendarEventEntry()
-		event.title = atom.data.Title(text=title)
-
+		date_format = '%Y-%m-%dT%H:%M:%S'
 		offset_str = timezone_offset_string()
-		event.when.append(gdata.data.When(
-			start=start.strftime('%Y-%m-%dT%H:%M:%S.000') + offset_str,
-			end=end.strftime('%Y-%m-%dT%H:%M:%S.000') + offset_str
-		))
+		event = {
+			'summary': title,
+			'start': {
+				'dateTime': start.strftime('{}{}'.format(date_format, offset_str))
+			},
+			'end': {
+				'dateTime': end.strftime('{}{}'.format(date_format, offset_str))
+			},
+		}
 
-		svc = calService()[0]
-		return svc.InsertEvent(event)
+		svc = cal_service()
+		return svc.events().insert(
+			calendarId=CALENDAR_NAME, body=event
+		).execute()
 
 	def test_all_day_event(self):
 		trigger_key = 'vacation'
@@ -712,8 +680,7 @@ class ExpectedReturnTest(unittest.TestCase):
 
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(event_start,
 				[event], trigger_key, who))
@@ -768,8 +735,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# Midnight before
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				self.days[calendar.MONDAY],
@@ -778,8 +744,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# During
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				datetime.datetime.combine(
@@ -790,13 +755,11 @@ class ExpectedReturnTest(unittest.TestCase):
 		# Weekend before
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				datetime.datetime.combine(
-					self.days[calendar.SATURDAY] -
-						datetime.timedelta(days=7),
+					self.days[calendar.SATURDAY] - datetime.timedelta(days=7),
 					datetime.time(hour=12)),
 				[event], trigger_key, who))
 
@@ -805,8 +768,7 @@ class ExpectedReturnTest(unittest.TestCase):
 			None,
 			expected_return(
 				datetime.datetime.combine(
-					self.days[calendar.FRIDAY] -
-						datetime.timedelta(days=7),
+					self.days[calendar.FRIDAY] - datetime.timedelta(days=7),
 					datetime.time(hour=12)),
 				[event], trigger_key, who))
 
@@ -823,8 +785,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# Midnight before
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				datetime.datetime.combine(
@@ -835,8 +796,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# During
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				self.days[calendar.WEDNESDAY],
@@ -845,8 +805,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# Weekend before
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				datetime.datetime.combine(
@@ -860,8 +819,7 @@ class ExpectedReturnTest(unittest.TestCase):
 			None,
 			expected_return(
 				datetime.datetime.combine(
-					self.days[calendar.FRIDAY] -
-						datetime.timedelta(days=7),
+					self.days[calendar.FRIDAY] - datetime.timedelta(days=7),
 					datetime.time()),
 				events, trigger_key, who))
 
@@ -881,8 +839,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# Midnight before
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				datetime.datetime.combine(
@@ -893,8 +850,7 @@ class ExpectedReturnTest(unittest.TestCase):
 		# During
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				self.days[calendar.WEDNESDAY],
@@ -903,13 +859,11 @@ class ExpectedReturnTest(unittest.TestCase):
 		# Weekend before
 		self.assertEqual(
 			datetime.datetime.combine(
-				self.days[calendar.MONDAY] +
-					datetime.timedelta(days=7),
+				self.days[calendar.MONDAY] + datetime.timedelta(days=7),
 				TRIGGERS[trigger_key]['day_start']),
 			expected_return(
 				datetime.datetime.combine(
-					self.days[calendar.SATURDAY] -
-						datetime.timedelta(days=7),
+					self.days[calendar.SATURDAY] - datetime.timedelta(days=7),
 					datetime.time()),
 				events, trigger_key, who))
 
@@ -918,52 +872,82 @@ class ExpectedReturnTest(unittest.TestCase):
 			None,
 			expected_return(
 				datetime.datetime.combine(
-					self.days[calendar.FRIDAY] -
-						datetime.timedelta(days=7),
+					self.days[calendar.FRIDAY] - datetime.timedelta(days=7),
 					datetime.time()),
 				events, trigger_key, who))
 
-if __name__ == '__main__':
-	parser = optparse.OptionParser(
-		usage='%%prog [-d] [-m] [-t] %s USERNAME -- [SUBPROGRAM [ARG...]]' %
-			'|'.join(sorted(TRIGGERS)),
-		version='%prog $Id$')
-	parser.add_option('-d', '--date-format', dest='date_format',
-		default='%A, %d %B',
-		metavar='FORMAT',
-		help='specify a strftime() format to use for the return date')
-	parser.add_option('-m', '--message', dest='msg_template',
-		default=os.path.expanduser(os.path.join('~', '.vacation.msg')),
-		metavar='FILE',
-		help='message template to pass as the subprogram\'s @MSG_FILE@ argument')
-	parser.add_option('-t', '--test', dest='test', default=False,
-		action='store_true',
-		help='run the test suite')
 
-	(options, args) = parser.parse_args()
+def _run_init(args):
+	sys.argv = sys.argv[1:]
+	get_credentials()
+	sys.exit(0)
 
-	if options.test:
-		# unittest.main() parses arguments too, so pass
-		# along any non-option arguments to it.
-		sys.argv[1:] = args
 
-		unittest.main()
-		sys.exit(0)
+def _run_test(args):
+	sys.argv = sys.argv[1:]
+	unittest.main()
+	sys.exit(0)
 
-	if len(args) < 2:
-		parser.print_usage()
-		sys.exit(EX_USAGE)
 
-	if args[0] not in TRIGGERS:
-		print('Action must be one of: %s' % \
-			', '.join(sorted(TRIGGERS)))
-		parser.print_usage()
-		sys.exit(EX_USAGE)
+def _run_check(args):
+	success_exec = []
+	if args.subprogram:
+		success_exec.append(args.subprogram)
+		if args.subprogram_args:
+			success_exec.extend(args.subprogram_args)
 
 	try:
-		sys.exit(main(args[0], args[1], args[2:], options))
+		sys.exit(main(args.trigger, args.username, success_exec, args))
 	except Exception as e:
 		sys.stderr.write(str(e))
 		sys.stderr.write('\n')
 		traceback.print_exc(file=sys.stderr)
 		sys.exit(EX_TEMPFAIL)
+
+
+if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	subparsers = parser.add_subparsers(
+		title='subcommands', description='valid subcommands')
+
+	tools.argparser.set_defaults(func=_run_init)
+	subparsers.choices['init'] = tools.argparser
+
+	parser_test = subparsers.add_parser('test')
+	parser_test.set_defaults(func=_run_test)
+
+	parser_test.add_argument('args', nargs='*', help='unittest arguments')
+
+	parser_check = subparsers.add_parser('check')
+	parser_check.set_defaults(func=_run_check)
+
+	parser_check.add_argument(
+		'-d', '--date-format', dest='date_format',
+		default='%A, %d %B',
+		metavar='FORMAT',
+		help='strftime() format to use for the return date')
+	parser_check.add_argument(
+		'-m', '--message', dest='msg_template',
+		default=os.path.expanduser(os.path.join('~', '.vacation.msg')),
+		metavar='FILE',
+		help="message template to pass as the subprogram's @MSG_FILE@ argument")
+	parser_check.add_argument(
+		'trigger', choices=sorted(TRIGGERS),
+		help='matching text in event title')
+	parser_check.add_argument(
+		'username',
+		help='username or other identifying text that must be in event title')
+	parser_check.add_argument(
+		'subprogram', nargs='?',
+		help='name of program to execute')
+	parser_check.add_argument(
+		'subprogram_args', nargs='*',
+		help='arguments to pass to subprogram')
+
+	args = parser.parse_args()
+
+	if not hasattr(args, 'func'):
+		parser.error('no subcommand specified')
+		sys.exit(1)
+
+	args.func(args)
